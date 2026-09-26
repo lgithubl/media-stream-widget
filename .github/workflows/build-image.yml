@@ -1,0 +1,129 @@
+name: Build Media Stream Widget Image
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Image tag to publish
+        required: true
+        default: latest
+      export_artifact:
+        description: Export image tar.gz artifact
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    name: Build and publish media stream widget image
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Prepare image name
+        id: image
+        shell: bash
+        run: |
+          IMAGE="ghcr.io/${{ github.repository }}:${{ inputs.tag }}"
+          echo "image=${IMAGE,,}" >> "$GITHUB_OUTPUT"
+          echo "artifact_name=media-stream-widget-${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          echo "smoke_image=media-stream-widget-smoke:${{ github.run_id }}" >> "$GITHUB_OUTPUT"
+
+      - name: Build smoke image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          load: true
+          tags: ${{ steps.image.outputs.smoke_image }}
+          cache-from: type=gha,scope=media-stream-widget
+          cache-to: type=gha,mode=max,scope=media-stream-widget
+
+      - name: Smoke image locally
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/media-stream-widget-data"
+          docker run -d --name media-stream-widget-smoke \
+            -p 8080:8080 \
+            -e MEDIA_STREAM_UPLOAD_ENABLED=true \
+            -e MEDIA_STREAM_UPLOAD_DIR=/data/uploads \
+            -v "$RUNNER_TEMP/media-stream-widget-data:/data" \
+            "${{ steps.image.outputs.smoke_image }}"
+          for i in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:8080/health | tee "$RUNNER_TEMP/media-stream-widget-health.json" | grep -q '"ok":true'; then
+              break
+            fi
+            docker logs --tail 80 media-stream-widget-smoke || true
+            sleep 2
+          done
+          grep -q '"sendfileEnabled":true' "$RUNNER_TEMP/media-stream-widget-health.json"
+          python - <<'PY'
+          import math
+          import struct
+          import wave
+
+          rate = 8000
+          with wave.open("/tmp/smoke.wav", "wb") as wav:
+              wav.setnchannels(1)
+              wav.setsampwidth(2)
+              wav.setframerate(rate)
+              for index in range(rate):
+                  sample = int(12000 * math.sin(2 * math.pi * 440 * index / rate))
+                  wav.writeframes(struct.pack("<h", sample))
+          PY
+          curl -fsS http://127.0.0.1:8080/api/upload \
+            -F "file=@/tmp/smoke.wav;type=audio/wav" \
+            | tee "$RUNNER_TEMP/media-stream-widget-upload.json"
+          FILE_ID="$(python - <<'PY'
+          import json
+          import os
+          print(json.load(open(os.environ["RUNNER_TEMP"] + "/media-stream-widget-upload.json"))["id"])
+          PY
+          )"
+          curl -fsS -H "Range: bytes=0-31" "http://127.0.0.1:8080/api/stream/$FILE_ID" >/tmp/smoke-range.bin
+          test "$(wc -c </tmp/smoke-range.bin)" -eq 32
+          curl -fsS http://127.0.0.1:8080/api/stats | tee "$RUNNER_TEMP/media-stream-widget-stats.json"
+          grep -q '"sendfileRequests":1' "$RUNNER_TEMP/media-stream-widget-stats.json"
+          docker rm -f media-stream-widget-smoke
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          tags: ${{ steps.image.outputs.image }}
+          cache-from: type=gha,scope=media-stream-widget
+          cache-to: type=gha,mode=max,scope=media-stream-widget
+
+      - name: Export image tarball
+        if: ${{ inputs.export_artifact }}
+        run: |
+          docker pull "${{ steps.image.outputs.image }}"
+          docker save "${{ steps.image.outputs.image }}" | gzip -1 > "${{ steps.image.outputs.artifact_name }}.tar.gz"
+          ls -lh "${{ steps.image.outputs.artifact_name }}.tar.gz"
+
+      - name: Upload image artifact
+        if: ${{ inputs.export_artifact }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ steps.image.outputs.artifact_name }}
+          path: ${{ steps.image.outputs.artifact_name }}.tar.gz
+          if-no-files-found: error
+          retention-days: 7

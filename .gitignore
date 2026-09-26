@@ -1,0 +1,6 @@
+/target/
+/data/
+/.DS_Store
+*.log
+*.tar.gz
+*.tmp

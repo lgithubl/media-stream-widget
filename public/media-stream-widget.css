@@ -1,0 +1,112 @@
+:root {
+  color-scheme: light;
+  font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  background: #f6f7f9;
+  color: #172026;
+}
+
+body {
+  margin: 0;
+}
+
+main {
+  max-width: 960px;
+  margin: 0 auto;
+  padding: 24px 16px;
+}
+
+.aw-root {
+  display: grid;
+  gap: 12px;
+}
+
+.aw-toolbar {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 8px;
+  align-items: center;
+  padding: 10px;
+  border: 1px solid #d6dde6;
+  border-radius: 8px;
+  background: white;
+}
+
+.aw-toolbar input {
+  min-width: 0;
+}
+
+.aw-button {
+  border: 1px solid #334155;
+  border-radius: 6px;
+  padding: 7px 10px;
+  background: #334155;
+  color: white;
+  cursor: pointer;
+  font: inherit;
+  font-weight: 650;
+}
+
+.aw-button:disabled {
+  opacity: .55;
+  cursor: wait;
+}
+
+.aw-message {
+  min-height: 20px;
+  color: #526173;
+}
+
+.aw-list {
+  display: grid;
+  gap: 6px;
+}
+
+.aw-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 8px;
+  align-items: center;
+  padding: 9px 10px;
+  border: 1px solid #d6dde6;
+  border-radius: 8px;
+  background: white;
+}
+
+.aw-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 650;
+}
+
+.aw-meta {
+  color: #66758a;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.aw-player {
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid #d6dde6;
+  border-radius: 8px;
+  background: white;
+}
+
+.aw-player audio,
+.aw-player video {
+  width: 100%;
+}
+
+.aw-player video {
+  max-height: min(70vh, 720px);
+  background: #111827;
+}
+
+@media (max-width: 640px) {
+  .aw-toolbar,
+  .aw-row {
+    grid-template-columns: 1fr;
+  }
+}
