@@ -143,7 +143,7 @@
         if (state.selected && !state.files.some((file) => file.id === state.selected.id)) {
           state.selected = null;
         }
-        state.message = `Loaded ${state.files.length} audio file(s).`;
+        state.message = `Loaded ${state.files.length} media file(s).`;
       } catch (error) {
         state.message = error.message || String(error);
       } finally {

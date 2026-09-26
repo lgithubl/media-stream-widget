@@ -26,12 +26,43 @@ Open `http://127.0.0.1:8080`.
 MediaStreamWidget.mount("#media-stream-widget", {
   apiBase: "http://127.0.0.1:8080",
   tracks: [
-    { name: "example.mp3", path: "/absolute/path/to/example.mp3" }
+    { name: "example.mp3", path: "/absolute/path/to/example.mp3" },
+    { name: "example.mp4", path: "/absolute/path/to/example.mp4" }
   ],
   uploadEnabled: true
 });
 </script>
 ```
+
+## Video Example
+
+Video uses the same backend stream API. If the file extension is `mp4`, `m4v`,
+`mov`, `mkv`, or `webm`, the widget renders a native `<video controls>` player.
+
+```html
+<link rel="stylesheet" href="/media-stream-widget.css">
+<div id="video-widget"></div>
+<script src="/media-stream-widget.js"></script>
+<script>
+MediaStreamWidget.mount("#video-widget", {
+  apiBase: "http://127.0.0.1:8080",
+  tracks: [
+    {
+      name: "movie.mp4",
+      path: "/absolute/path/to/movie.mp4"
+    },
+    {
+      name: "clip.webm",
+      path: "/absolute/path/to/clip.webm"
+    }
+  ],
+  uploadEnabled: false
+});
+</script>
+```
+
+For best browser compatibility, use codecs the browser can play natively. MP4
+with front-loaded metadata, often called faststart, gives faster first playback.
 
 External sites can host `media-stream-widget.js` and `media-stream-widget.css` themselves, or
 load them from this backend. Only `apiBase` has to point at the deployed backend.
