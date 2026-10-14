@@ -106,9 +106,40 @@ Useful runtime tuning variables:
   Linux sendfile server. Defaults to `0`, which leaves the OS default.
 - `MEDIA_STREAM_CACHE_CONTROL`: `Cache-Control` header for media streams.
   Defaults to `no-store`.
+- `MEDIA_STREAM_TRANSCODE_ENABLED`: enables on-demand audio transcoding for
+  browser-unsupported audio codecs (see below). Defaults to `true`.
+- `MEDIA_STREAM_TRANSCODE_CACHE_DIR`: directory for cached transcode output.
+  Defaults to `<data dir>/transcode-cache`.
+- `MEDIA_STREAM_TRANSCODE_AUDIO_CODECS`: comma-separated list of audio codec
+  names (as reported by `ffprobe`) that trigger a transcode. Defaults to
+  `ac3,eac3`.
 
 Older `AUDIO_WIDGET_*` variables are still accepted as fallbacks. If both names
 are set, `MEDIA_STREAM_*` wins.
+
+## On-demand audio transcoding
+
+Browsers generally cannot decode AC-3/E-AC-3 (Dolby Digital) audio natively,
+so files with those audio tracks play back silently through the native
+`<audio>`/`<video>` elements this widget relies on. Rather than batch
+transcoding an entire media library up front, the backend resolves this
+lazily, the first time a file is actually streamed:
+
+1. `ffprobe` checks the first audio stream's codec (container header read
+   only, no decoding).
+2. If the codec is in `MEDIA_STREAM_TRANSCODE_AUDIO_CODECS`, `ffmpeg` remuxes
+   the file into an mp4 with the video track stream-copied untouched and only
+   the audio track re-encoded to AAC. This is written atomically (temp file +
+   rename) into `MEDIA_STREAM_TRANSCODE_CACHE_DIR`, sharded by the first few
+   characters of the stream id.
+3. Subsequent requests for the same file are served straight from the cache;
+   files whose audio codec needs no conversion are streamed unmodified with
+   effectively no added overhead.
+
+The backend does not evict cache entries on its own -- operators are expected
+to run their own periodic cleanup (e.g. deleting cache files older than N days
+by mtime). The lookup is self-healing: if a cached file is removed externally,
+the next request simply re-detects and re-transcodes it.
 
 The GitHub workflow publishes:
 

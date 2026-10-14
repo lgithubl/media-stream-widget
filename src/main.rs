@@ -1,8 +1,9 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -57,6 +58,20 @@ struct AppState {
     prefetch_max_tasks: usize,
     prefetch_semaphore: Arc<Semaphore>,
     prefetch_paths: Arc<Mutex<HashSet<String>>>,
+    transcode_enabled: bool,
+    transcode_cache_dir: Arc<PathBuf>,
+    transcode_audio_codecs: Arc<HashSet<String>>,
+    transcode_decisions: Arc<StdMutex<HashMap<String, TranscodeDecision>>>,
+    transcode_inflight: Arc<StdMutex<HashMap<String, Arc<StdMutex<()>>>>>,
+}
+
+#[derive(Clone)]
+enum TranscodeDecision {
+    Passthrough,
+    Cached {
+        path: PathBuf,
+        content_type: String,
+    },
 }
 
 #[derive(Default)]
@@ -309,11 +324,36 @@ async fn main() -> Result<()> {
         1,
         64,
     );
+    let transcode_enabled = env_bool(
+        "MEDIA_STREAM_TRANSCODE_ENABLED",
+        "AUDIO_WIDGET_TRANSCODE_ENABLED",
+        true,
+    );
+    let transcode_cache_dir = env_var(
+        "MEDIA_STREAM_TRANSCODE_CACHE_DIR",
+        "AUDIO_WIDGET_TRANSCODE_CACHE_DIR",
+    )
+    .map(PathBuf::from)
+    .unwrap_or_else(|_| data_dir.join("transcode-cache"));
+    let transcode_audio_codecs: HashSet<String> = env_var(
+        "MEDIA_STREAM_TRANSCODE_AUDIO_CODECS",
+        "AUDIO_WIDGET_TRANSCODE_AUDIO_CODECS",
+    )
+    .unwrap_or_else(|_| "ac3,eac3".to_string())
+    .split(',')
+    .map(|value| value.trim().to_ascii_lowercase())
+    .filter(|value| !value.is_empty())
+    .collect();
 
     if upload_enabled {
         fs::create_dir_all(&upload_dir)
             .await
             .context("create upload dir")?;
+    }
+    if transcode_enabled {
+        fs::create_dir_all(&transcode_cache_dir)
+            .await
+            .context("create transcode cache dir")?;
     }
 
     let state = AppState {
@@ -337,6 +377,11 @@ async fn main() -> Result<()> {
         prefetch_max_tasks,
         prefetch_semaphore: Arc::new(Semaphore::new(prefetch_max_tasks)),
         prefetch_paths: Arc::new(Mutex::new(HashSet::new())),
+        transcode_enabled,
+        transcode_cache_dir: Arc::new(transcode_cache_dir),
+        transcode_audio_codecs: Arc::new(transcode_audio_codecs),
+        transcode_decisions: Arc::new(StdMutex::new(HashMap::new())),
+        transcode_inflight: Arc::new(StdMutex::new(HashMap::new())),
     };
 
     let host =
@@ -413,6 +458,9 @@ async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
         "readChunkBytes": state.read_chunk_bytes,
         "prefetchBytes": state.prefetch_bytes,
         "prefetchMaxTasks": state.prefetch_max_tasks,
+        "transcodeEnabled": state.transcode_enabled,
+        "transcodeCacheDir": state.transcode_cache_dir.to_string_lossy(),
+        "transcodeAudioCodecs": state.transcode_audio_codecs.iter().collect::<Vec<_>>(),
     }))
 }
 
@@ -432,6 +480,9 @@ async fn config(State(state): State<AppState>) -> Json<serde_json::Value> {
         "readChunkBytes": state.read_chunk_bytes,
         "prefetchBytes": state.prefetch_bytes,
         "prefetchMaxTasks": state.prefetch_max_tasks,
+        "transcodeEnabled": state.transcode_enabled,
+        "transcodeCacheDir": state.transcode_cache_dir.to_string_lossy(),
+        "transcodeAudioCodecs": state.transcode_audio_codecs.iter().collect::<Vec<_>>(),
         "mediaExtensions": MEDIA_EXTENSIONS,
         "audioExtensions": ["aac", "flac", "m4a", "mp3", "ogg", "opus", "wav", "webm"],
         "videoExtensions": ["m4v", "mkv", "mov", "mp4", "webm"],
@@ -587,7 +638,15 @@ async fn stream_path(
             return Err(error);
         }
     };
-    let metadata = match fs::metadata(&path).await {
+    let (serve_path, content_type_override) = {
+        let state = state.clone();
+        let original = path.clone();
+        let id = encoded_path.clone();
+        tokio::task::spawn_blocking(move || resolve_stream_path_sync(&state, &original, &id))
+            .await
+            .unwrap_or_else(|_| (path.clone(), None))
+    };
+    let metadata = match fs::metadata(&serve_path).await {
         Ok(metadata) => metadata,
         Err(_) => {
             record_stream_status(&state.stats, StatusCode::NOT_FOUND);
@@ -625,9 +684,11 @@ async fn stream_path(
         .stats
         .stream_requested_bytes
         .fetch_add(length, Ordering::Relaxed);
-    let content_type = mime_guess::from_path(&path)
-        .first_or_octet_stream()
-        .to_string();
+    let content_type = content_type_override.unwrap_or_else(|| {
+        mime_guess::from_path(&serve_path)
+            .first_or_octet_stream()
+            .to_string()
+    });
 
     let mut response_headers = HeaderMap::new();
     response_headers.insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
@@ -658,7 +719,7 @@ async fn stream_path(
     }
 
     let open_started = Instant::now();
-    let mut file = match File::open(&path).await {
+    let mut file = match File::open(&serve_path).await {
         Ok(file) => file,
         Err(_) => {
             record_stream_status(&state.stats, StatusCode::NOT_FOUND);
@@ -689,7 +750,7 @@ async fn stream_path(
         .stream_seek_us_total
         .fetch_add(seek_us, Ordering::Relaxed);
     atomic_max(&state.stats.stream_seek_us_max, seek_us);
-    spawn_prefetch(state.clone(), path.clone(), end.saturating_add(1), total).await;
+    spawn_prefetch(state.clone(), serve_path.clone(), end.saturating_add(1), total).await;
     let setup_us = elapsed_us(request_started);
     state
         .stats
@@ -1141,6 +1202,231 @@ fn decode_path(value: &str) -> Result<PathBuf, AppError> {
     Ok(PathBuf::from(path))
 }
 
+/// Shard an id (already filesystem-safe base64url) into a two-level cache directory,
+/// e.g. id "abcdxxxx" -> cache_root/ab/cd/abcdxxxx.{cache,json}.
+fn cache_paths_for_id(cache_root: &Path, id: &str) -> (PathBuf, PathBuf, PathBuf) {
+    let shard1 = &id[..id.len().min(2)];
+    let shard2_start = id.len().min(2);
+    let shard2_end = id.len().min(4);
+    let shard2 = &id[shard2_start..shard2_end];
+    let shard2 = if shard2.is_empty() { "_" } else { shard2 };
+    let shard_dir = cache_root.join(shard1.to_string()).join(shard2);
+    let data_path = shard_dir.join(format!("{id}.cache"));
+    let json_path = shard_dir.join(format!("{id}.json"));
+    (shard_dir, data_path, json_path)
+}
+
+/// Probe the first audio stream's codec name without decoding anything (reads container
+/// headers only). Returns None if ffprobe is unavailable, the file has no audio stream, or
+/// probing otherwise fails.
+fn probe_audio_codec(path: &Path) -> Option<String> {
+    let output = std::process::Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "a:0",
+            "-show_entries",
+            "stream=codec_name",
+            "-of",
+            "csv=p=0",
+        ])
+        .arg(path)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let codec = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .to_ascii_lowercase();
+    if codec.is_empty() { None } else { Some(codec) }
+}
+
+/// Load a previously-written cache entry from disk (survives process restarts). Only counts
+/// as a hit when both the data file exists and the sidecar json reports status "ready" --
+/// anything else (missing data file, missing/invalid json, non-ready status) is treated as a
+/// miss so an external cleanup job deleting files never produces an inconsistent read.
+fn load_cache_entry(data_path: &Path, json_path: &Path) -> Option<TranscodeDecision> {
+    if !data_path.is_file() {
+        return None;
+    }
+    let json_text = std::fs::read_to_string(json_path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&json_text).ok()?;
+    if value.get("status").and_then(|v| v.as_str()) != Some("ready") {
+        return None;
+    }
+    let content_type = value.get("contentType").and_then(|v| v.as_str())?.to_string();
+    Some(TranscodeDecision::Cached {
+        path: data_path.to_path_buf(),
+        content_type,
+    })
+}
+
+/// Remux `source` into an mp4 with its audio re-encoded to AAC while the video stream (if any)
+/// is stream-copied untouched -- only the small audio track is actually re-encoded, so CPU cost
+/// is a tiny fraction of a full video transcode. Writes to a `.tmp` file and renames into place
+/// so concurrent readers never observe a half-written file.
+fn transcode_to_cache(
+    source: &Path,
+    shard_dir: &Path,
+    data_path: &Path,
+    json_path: &Path,
+) -> Result<String> {
+    std::fs::create_dir_all(shard_dir).context("create cache shard dir")?;
+    let content_type = if is_video_name(source) {
+        "video/mp4"
+    } else {
+        "audio/mp4"
+    };
+
+    let tmp_data = data_path.with_extension("cache.tmp");
+    let status = std::process::Command::new("ffmpeg")
+        .arg("-y")
+        .arg("-i")
+        .arg(source)
+        .args([
+            "-map", "0:v?", "-map", "0:a:0", "-c:v", "copy", "-c:a", "aac", "-sn",
+            "-movflags", "+faststart", "-f", "mp4",
+        ])
+        .arg(&tmp_data)
+        .status()
+        .context("spawn ffmpeg")?;
+    if !status.success() {
+        let _ = std::fs::remove_file(&tmp_data);
+        anyhow::bail!("ffmpeg exited with {status}");
+    }
+    std::fs::rename(&tmp_data, data_path).context("rename transcoded data file into place")?;
+
+    let json_tmp = json_path.with_extension("json.tmp");
+    std::fs::write(
+        &json_tmp,
+        serde_json::json!({
+            "status": "ready",
+            "contentType": content_type,
+            "createdAtUnix": now_unix(),
+        })
+        .to_string(),
+    )
+    .context("write cache metadata")?;
+    std::fs::rename(&json_tmp, json_path).context("rename cache metadata into place")?;
+
+    Ok(content_type.to_string())
+}
+
+fn is_video_name(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| {
+            ["m4v", "mkv", "mov", "mp4", "webm"].contains(&ext.to_ascii_lowercase().as_str())
+        })
+        .unwrap_or(false)
+}
+
+/// Core on-demand transcode/cache orchestration, shared by both serving paths (the async axum
+/// handler wraps this in `spawn_blocking`; the hand-rolled sendfile path already runs on a
+/// blocking OS thread and calls it directly). Returns the path that should actually be streamed
+/// (either the original file, or a cached remux) plus an optional content-type override to use
+/// instead of guessing from the resolved path's extension.
+fn resolve_stream_path_sync(
+    state: &AppState,
+    original: &Path,
+    id: &str,
+) -> (PathBuf, Option<String>) {
+    if !state.transcode_enabled {
+        return (original.to_path_buf(), None);
+    }
+
+    if let Some(decision) = state.transcode_decisions.lock().unwrap().get(id).cloned() {
+        match decision {
+            TranscodeDecision::Passthrough => return (original.to_path_buf(), None),
+            TranscodeDecision::Cached { path, content_type } if path.is_file() => {
+                return (path, Some(content_type));
+            }
+            TranscodeDecision::Cached { .. } => {
+                // Cached file disappeared (external cleanup) -- fall through and re-resolve.
+            }
+        }
+    }
+
+    let lock = {
+        let mut inflight = state.transcode_inflight.lock().unwrap();
+        inflight
+            .entry(id.to_string())
+            .or_insert_with(|| Arc::new(StdMutex::new(())))
+            .clone()
+    };
+    let _guard = lock.lock().unwrap();
+
+    // Re-check now that we hold the per-id lock: another request may have just finished.
+    if let Some(decision) = state.transcode_decisions.lock().unwrap().get(id).cloned() {
+        match decision {
+            TranscodeDecision::Passthrough => {
+                cleanup_inflight(state, id);
+                return (original.to_path_buf(), None);
+            }
+            TranscodeDecision::Cached { path, content_type } if path.is_file() => {
+                cleanup_inflight(state, id);
+                return (path, Some(content_type));
+            }
+            TranscodeDecision::Cached { .. } => {}
+        }
+    }
+
+    let (shard_dir, data_path, json_path) = cache_paths_for_id(&state.transcode_cache_dir, id);
+    if let Some(cached) = load_cache_entry(&data_path, &json_path) {
+        state
+            .transcode_decisions
+            .lock()
+            .unwrap()
+            .insert(id.to_string(), cached.clone());
+        cleanup_inflight(state, id);
+        if let TranscodeDecision::Cached { path, content_type } = cached {
+            return (path, Some(content_type));
+        }
+    }
+
+    let needs_transcode = probe_audio_codec(original)
+        .map(|codec| state.transcode_audio_codecs.contains(&codec))
+        .unwrap_or(false);
+
+    if !needs_transcode {
+        state
+            .transcode_decisions
+            .lock()
+            .unwrap()
+            .insert(id.to_string(), TranscodeDecision::Passthrough);
+        cleanup_inflight(state, id);
+        return (original.to_path_buf(), None);
+    }
+
+    match transcode_to_cache(original, &shard_dir, &data_path, &json_path) {
+        Ok(content_type) => {
+            state.transcode_decisions.lock().unwrap().insert(
+                id.to_string(),
+                TranscodeDecision::Cached {
+                    path: data_path.clone(),
+                    content_type: content_type.clone(),
+                },
+            );
+            cleanup_inflight(state, id);
+            (data_path, Some(content_type))
+        }
+        Err(error) => {
+            eprintln!("transcode failed for id {id}: {error:?}");
+            // Deliberately not caching a negative decision: a transient/edge-case ffmpeg
+            // failure shouldn't permanently stick a file with "known-bad as passthrough".
+            // Worst case a persistently-broken file retries ffprobe+ffmpeg on every request.
+            cleanup_inflight(state, id);
+            (original.to_path_buf(), None)
+        }
+    }
+}
+
+fn cleanup_inflight(state: &AppState, id: &str) {
+    state.transcode_inflight.lock().unwrap().remove(id);
+}
+
 async fn ensure_streamable_path(encoded_path: &str) -> Result<PathBuf, AppError> {
     let path = decode_path(encoded_path)?;
     if !is_media_name(&path) {
@@ -1486,7 +1772,8 @@ fn handle_sendfile_stream(
             return write_json_error(stream, error.status, &error.detail);
         }
     };
-    let metadata = match std::fs::metadata(&path) {
+    let (serve_path, content_type_override) = resolve_stream_path_sync(state, &path, encoded);
+    let metadata = match std::fs::metadata(&serve_path) {
         Ok(metadata) => metadata,
         Err(_) => {
             record_stream_status(&state.stats, StatusCode::NOT_FOUND);
@@ -1524,9 +1811,11 @@ fn handle_sendfile_stream(
         .stats
         .stream_requested_bytes
         .fetch_add(length, Ordering::Relaxed);
-    let content_type = mime_guess::from_path(&path)
-        .first_or_octet_stream()
-        .to_string();
+    let content_type = content_type_override.unwrap_or_else(|| {
+        mime_guess::from_path(&serve_path)
+            .first_or_octet_stream()
+            .to_string()
+    });
     let mut headers = vec![
         ("Accept-Ranges".to_string(), "bytes".to_string()),
         (
@@ -1561,7 +1850,7 @@ fn handle_sendfile_stream(
     }
 
     let open_started = Instant::now();
-    let file = match std::fs::File::open(&path) {
+    let file = match std::fs::File::open(&serve_path) {
         Ok(file) => file,
         Err(_) => {
             state.stats.stream_errors.fetch_add(1, Ordering::Relaxed);
@@ -1575,7 +1864,7 @@ fn handle_sendfile_stream(
         .stream_open_us_total
         .fetch_add(open_us, Ordering::Relaxed);
     atomic_max(&state.stats.stream_open_us_max, open_us);
-    spawn_prefetch_sync(state, path.clone(), end.saturating_add(1), total);
+    spawn_prefetch_sync(state, serve_path.clone(), end.saturating_add(1), total);
 
     let out_fd = stream.as_raw_fd();
     let in_fd = file.as_raw_fd();
@@ -1966,6 +2255,9 @@ fn health_json(state: &AppState) -> serde_json::Value {
         "readChunkBytes": state.read_chunk_bytes,
         "prefetchBytes": state.prefetch_bytes,
         "prefetchMaxTasks": state.prefetch_max_tasks,
+        "transcodeEnabled": state.transcode_enabled,
+        "transcodeCacheDir": state.transcode_cache_dir.to_string_lossy(),
+        "transcodeAudioCodecs": state.transcode_audio_codecs.iter().collect::<Vec<_>>(),
     })
 }
 
@@ -1983,6 +2275,9 @@ fn config_json(state: &AppState) -> serde_json::Value {
         "readChunkBytes": state.read_chunk_bytes,
         "prefetchBytes": state.prefetch_bytes,
         "prefetchMaxTasks": state.prefetch_max_tasks,
+        "transcodeEnabled": state.transcode_enabled,
+        "transcodeCacheDir": state.transcode_cache_dir.to_string_lossy(),
+        "transcodeAudioCodecs": state.transcode_audio_codecs.iter().collect::<Vec<_>>(),
         "mediaExtensions": MEDIA_EXTENSIONS,
         "audioExtensions": ["aac", "flac", "m4a", "mp3", "ogg", "opus", "wav", "webm"],
         "videoExtensions": ["m4v", "mkv", "mov", "mp4", "webm"],

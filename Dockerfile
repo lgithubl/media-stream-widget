@@ -8,6 +8,10 @@ RUN cargo build --release
 
 FROM debian:bookworm-slim
 
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
 ENV MEDIA_STREAM_HOST=0.0.0.0 \
     MEDIA_STREAM_PORT=8080 \
     MEDIA_STREAM_DATA_DIR=/tmp/media-stream-widget \
@@ -20,7 +24,10 @@ ENV MEDIA_STREAM_HOST=0.0.0.0 \
     MEDIA_STREAM_READ_CHUNK_BYTES=1048576 \
     MEDIA_STREAM_PREFETCH_BYTES=8388608 \
     MEDIA_STREAM_PREFETCH_MAX_TASKS=2 \
-    MEDIA_STREAM_SENDFILE_ENABLED=true
+    MEDIA_STREAM_SENDFILE_ENABLED=true \
+    MEDIA_STREAM_TRANSCODE_ENABLED=true \
+    MEDIA_STREAM_TRANSCODE_CACHE_DIR=/tmp/media-stream-widget/transcode-cache \
+    MEDIA_STREAM_TRANSCODE_AUDIO_CODECS=ac3,eac3
 
 WORKDIR /app
 
